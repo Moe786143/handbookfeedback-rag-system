@@ -1,24 +1,30 @@
 """
-Handbook ingestion pipeline.
+Multi-source ingestion pipeline: Student Handbook (PDF) + ZAIO website.
 
-Run this once (or whenever the handbook changes) via run_ingest.py.
-It does the four things Part 1 of the assignment asks for, in order:
+Run this once (or whenever either source changes) via run_ingest.py.
+It does what Part 1 of this assignment asks for, in order:
 
-    1. Load the handbook PDF
-    2. Extract the text (page by page, so we can cite a page number later)
-    3. Split the text into overlapping chunks
-    4. Generate embeddings for each chunk and store them in ChromaDB
+    1. Load the Student Handbook (PDF)
+    2. Crawl and extract text from the ZAIO website
+    3. Clean the website content (strip nav/header/footer — see web_scraper.py)
+    4. Split both sources into chunks
+    5. Generate embeddings for every chunk
+    6. Store everything in the same vector database, with metadata recording
+       which source each chunk came from (Handbook + page number, or
+       Website + URL)
 
-Kept deliberately dependency-light and readable — no LangChain — so every
-step here is something you can point at and explain in one sentence.
+Both sources are normalised into the same shape early on — a list of
+{"source", "page", "url", "text"} dicts — so chunking, embedding, and
+storage don't need to know or care which source a piece of text came from.
+Only the final metadata written to ChromaDB (and the API's source citation
+built from it later) treats the two sources differently.
 """
+import re
 from pathlib import Path
 
 import chromadb
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-
-import re
 
 from app.config import (
     CHROMA_PATH,
@@ -27,7 +33,10 @@ from app.config import (
     COLLECTION_NAME,
     EMBEDDING_MODEL,
     HANDBOOK_PATH,
+    WEBSITE_MAX_PAGES,
+    WEBSITE_URL,
 )
+from app.web_scraper import crawl_website
 
 
 def fix_letter_spaced_text(text: str) -> str:
@@ -52,11 +61,8 @@ def fix_letter_spaced_text(text: str) -> str:
     single_char_ratio = single_char_tokens / len(tokens)
 
     if single_char_ratio < 0.4:
-        # Text is already normal — just collapse newlines/extra whitespace
-        # into single spaces, without touching genuine word-separating spaces.
         return re.sub(r"\s+", " ", text).strip()
 
-    # Text matches the letter-spaced pattern — apply the boundary-marking fix.
     WORD_BOUNDARY = "\x00"
     marked = text.replace("  ", WORD_BOUNDARY).replace("\n", WORD_BOUNDARY)
     no_letter_gaps = marked.replace(" ", "")
@@ -65,47 +71,61 @@ def fix_letter_spaced_text(text: str) -> str:
     return restored.strip()
 
 
-def load_pdf_pages(pdf_path: str) -> list[dict]:
+def load_handbook_documents(pdf_path: str) -> list[dict]:
     """
-    Step 1 + 2: Load the PDF and extract text, one entry per page.
+    Loads the Student Handbook and returns one document per page, in the
+    unified {"source", "page", "url", "text"} shape used by chunk_text().
 
-    Returns a list of {"page": <1-based page number>, "text": <page text>}.
-    Blank pages (e.g. section dividers with only an image) are skipped —
-    there's nothing to search on an empty page.
-
-    Text is passed through fix_letter_spaced_text() to repair the
-    letter-by-letter spacing this particular PDF export produces — see
-    that function's docstring for why this is necessary.
+    "url" is None here since a PDF page has no URL — chunk_text() and the
+    metadata builder both know to only use whichever of page/url applies
+    for a given source type.
     """
     reader = PdfReader(pdf_path)
-    pages = []
+    documents = []
 
     for i, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
         text = fix_letter_spaced_text(text)
         if text:
-            pages.append({"page": i, "text": text})
+            documents.append({"source": "Handbook", "page": i, "url": None, "text": text})
 
-    return pages
+    return documents
 
 
-def chunk_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[dict]:
+def load_website_documents(start_url: str = WEBSITE_URL, max_pages: int = WEBSITE_MAX_PAGES) -> list[dict]:
     """
-    Step 3: Split each page's text into overlapping word-based chunks.
+    Crawls the ZAIO website and returns one document per page, in the same
+    unified shape as load_handbook_documents() — "page" is None here since
+    website content is cited by URL, not a page number.
+    """
+    print(f"Crawling {start_url} (up to {max_pages} pages)...")
+    crawled = crawl_website(start_url, max_pages=max_pages)
 
-    Chunking per page (rather than concatenating the whole book first) means
-    every chunk already knows which page it came from — that's what lets the
-    API return a "source: Page 12" instead of just an answer with no citation.
+    return [
+        {"source": "Website", "page": None, "url": page["url"], "text": page["text"]}
+        for page in crawled
+    ]
 
-    Overlap means a sentence that gets cut in half by the chunk boundary
-    still appears in full in at least one of the two chunks.
 
-    Returns a list of {"page": int, "chunk_id": str, "text": str}.
+def chunk_text(
+    documents: list[dict], chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[dict]:
+    """
+    Splits each document's text into overlapping word-based chunks.
+
+    Chunking per document (rather than concatenating everything into one
+    giant blob first) means every chunk already knows exactly which page
+    or URL it came from — that's what lets the API cite "Student Handbook -
+    Page 12" or a real URL instead of just returning an answer with no
+    traceable source.
+
+    Overlap means a sentence cut in half by a chunk boundary still appears
+    in full in at least one of the two resulting chunks.
     """
     chunks = []
 
-    for page in pages:
-        words = page["text"].split()
+    for doc_index, doc in enumerate(documents):
+        words = doc["text"].split()
         step = chunk_size - overlap
 
         if not words:
@@ -116,22 +136,39 @@ def chunk_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, overlap: int = C
             if not chunk_words:
                 continue
 
-            chunk_text_value = " ".join(chunk_words)
-            chunk_id = f"page{page['page']}_chunk{start // step}"
+            chunk_id = f"{doc['source'].lower()}_{doc_index}_chunk{start // step}"
 
             chunks.append(
                 {
                     "chunk_id": chunk_id,
-                    "page": page["page"],
-                    "text": chunk_text_value,
+                    "source": doc["source"],
+                    "page": doc["page"],
+                    "url": doc["url"],
+                    "text": " ".join(chunk_words),
                 }
             )
 
-            # Stop once this chunk reaches the end of the page's words.
             if start + chunk_size >= len(words):
                 break
 
     return chunks
+
+
+def _build_metadata(chunk: dict) -> dict:
+    """
+    Builds the metadata dict stored alongside each chunk's embedding.
+
+    ChromaDB metadata values must be strings, numbers, or booleans — not
+    None — so this only includes the page number for Handbook chunks and
+    only the URL for Website chunks, rather than storing null placeholders
+    for whichever field doesn't apply.
+    """
+    metadata = {"source": chunk["source"]}
+    if chunk["source"] == "Handbook":
+        metadata["page"] = chunk["page"]
+    elif chunk["source"] == "Website":
+        metadata["url"] = chunk["url"]
+    return metadata
 
 
 def build_vector_store(
@@ -141,11 +178,15 @@ def build_vector_store(
     embedding_model_name: str = EMBEDDING_MODEL,
 ) -> None:
     """
-    Step 4: Generate an embedding for every chunk and store it in ChromaDB.
+    Generates an embedding for every chunk (regardless of source) and
+    stores them all in the same ChromaDB collection, each tagged with
+    metadata identifying which source it came from.
 
-    ChromaDB persists to disk at `chroma_path`, so ingestion only needs to
-    run once — the API reads from this same folder on every request rather
-    than re-embedding the handbook each time it starts.
+    Storing both sources in one collection (rather than two separate
+    databases) is what lets a single similarity search return the best
+    matching chunk across both the handbook and the website at once —
+    Part 2 asks the assistant to "search across knowledge sources", which
+    is naturally satisfied by there being only one place to search.
     """
     print(f"Loading embedding model '{embedding_model_name}'...")
     model = SentenceTransformer(embedding_model_name)
@@ -157,8 +198,6 @@ def build_vector_store(
     print(f"Writing to ChromaDB at '{chroma_path}'...")
     client = chromadb.PersistentClient(path=chroma_path)
 
-    # Start clean each time ingestion runs, so re-running it after editing
-    # the handbook doesn't leave stale chunks from the old version behind.
     try:
         client.delete_collection(collection_name)
     except Exception:
@@ -170,24 +209,38 @@ def build_vector_store(
         ids=[c["chunk_id"] for c in chunks],
         embeddings=embeddings,
         documents=texts,
-        metadatas=[{"page": c["page"]} for c in chunks],
+        metadatas=[_build_metadata(c) for c in chunks],
     )
 
     print(f"Done. {collection.count()} chunks stored in collection '{collection_name}'.")
 
 
-def run_ingestion(pdf_path: str = HANDBOOK_PATH) -> None:
-    """Runs the full pipeline: load -> chunk -> embed -> store."""
+def run_ingestion(
+    pdf_path: str = HANDBOOK_PATH,
+    website_url: str = WEBSITE_URL,
+    website_max_pages: int = WEBSITE_MAX_PAGES,
+) -> None:
+    """Runs the full pipeline across both sources: load -> chunk -> embed -> store."""
     if not Path(pdf_path).exists():
         raise FileNotFoundError(
             f"Handbook not found at '{pdf_path}'. Check HANDBOOK_PATH in your .env file."
         )
 
-    pages = load_pdf_pages(pdf_path)
-    print(f"Extracted text from {len(pages)} pages.")
+    handbook_docs = load_handbook_documents(pdf_path)
+    print(f"Extracted text from {len(handbook_docs)} handbook pages.")
 
-    chunks = chunk_text(pages)
-    print(f"Split into {len(chunks)} chunks (size={CHUNK_SIZE} words, overlap={CHUNK_OVERLAP}).")
+    website_docs = load_website_documents(website_url, website_max_pages)
+    print(f"Crawled and extracted text from {len(website_docs)} website pages.")
+
+    all_documents = handbook_docs + website_docs
+
+    chunks = chunk_text(all_documents)
+    handbook_chunk_count = sum(1 for c in chunks if c["source"] == "Handbook")
+    website_chunk_count = sum(1 for c in chunks if c["source"] == "Website")
+    print(
+        f"Split into {len(chunks)} chunks total "
+        f"({handbook_chunk_count} from handbook, {website_chunk_count} from website)."
+    )
 
     build_vector_store(chunks)
 

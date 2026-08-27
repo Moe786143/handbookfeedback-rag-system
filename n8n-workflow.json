@@ -1,0 +1,105 @@
+{
+  "name": "RAG Assistant - Ask and Email",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ask-rag",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-node",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "ask-rag"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/ask",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"question\": $json.body.question } }}",
+        "options": {}
+      },
+      "id": "http-request-node",
+      "name": "Call RAG API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Webhook').item.json.body.email }}",
+        "subject": "Your ZAIO Assistant Answer",
+        "emailType": "text",
+        "message": "=Question: {{ $('Webhook').item.json.body.question }}\n\nAnswer: {{ $json.answer }}\n\nSource: {{ $json.source }}",
+        "options": {}
+      },
+      "id": "gmail-node",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [680, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"received\", \"answer\": $('Call RAG API').item.json.answer, \"source\": $('Call RAG API').item.json.source } }}",
+        "options": {}
+      },
+      "id": "respond-node",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Call RAG API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call RAG API": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

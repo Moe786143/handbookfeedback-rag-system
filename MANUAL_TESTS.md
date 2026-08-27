@@ -1,25 +1,21 @@
 # Manual Test Log
 
-Part 4 of the assignment asks for the assistant to be tested with sample
-questions, documenting the question, the source page, and the answer
-returned. The questions below are drawn directly from the handbook content
-(fees, dates, grading, support), plus one deliberately out-of-scope question
-to confirm the "not available" behaviour actually works.
-
-**Page numbers below were verified by running the actual ingestion pipeline
-against this handbook** — they refer to the PDF's own sequential page order
-(see the README's "A note on page citations" section for why this system
-cites pages this way rather than the handbook's printed footer numbers,
-which have a couple of inconsistencies of their own).
+Part 4 asks for test cases covering questions answerable from the Student
+Handbook, questions answerable from the ZAIO website, and questions that
+cannot be answered from either source.
 
 **How to reproduce these:** with the API running (`uvicorn app.main:app
---reload`) and the handbook ingested (`python run_ingest.py`), run each
-curl command below and paste the actual response into the "Actual answer"
-column before submitting.
+--reload`) and both sources ingested (`python run_ingest.py` — this now
+crawls the live ZAIO website, so it needs an internet connection and takes
+longer than the previous assignment's PDF-only ingestion), run each curl
+command below and paste the actual response into the "Actual" column
+before submitting.
 
 ---
 
-### Test 1 — In-scope, factual
+## Category 1 — Handbook questions
+
+### Test 1
 
 **Question:** What are the total fees for the bootcamp?
 
@@ -31,46 +27,10 @@ curl -X POST http://localhost:8000/ask \
 
 | Field | Expected |
 |---|---|
-| Source | Page 16 |
+| Source | Student Handbook - Page 16 |
 | Answer | Should mention R 38,950 |
 
----
-
-### Test 2 — In-scope, factual
-
-**Question:** When must fees be paid by?
-
-```bash
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "When must fees be paid by?"}'
-```
-
-| Field | Expected |
-|---|---|
-| Source | Page 16 |
-| Answer | Should mention fees must be paid before orientation day, 30 October 2025 |
-
----
-
-### Test 3 — In-scope, factual
-
-**Question:** How is the final grade broken down?
-
-```bash
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "How is the final grade broken down?"}'
-```
-
-| Field | Expected |
-|---|---|
-| Source | Page 14 |
-| Answer | Should mention Final Project 35%, Assignments 25%, Coding Challenges 25%, MCQs 15% |
-
----
-
-### Test 4 — In-scope, factual
+### Test 2
 
 **Question:** What are the tutor support hours?
 
@@ -82,29 +42,63 @@ curl -X POST http://localhost:8000/ask \
 
 | Field | Expected |
 |---|---|
-| Source | Page 20 |
+| Source | Student Handbook - Page 20 |
 | Answer | Should mention Tuesdays 2-4pm & 6-8pm, Thursdays 10am-12pm & 6-8pm |
 
 ---
 
-### Test 5 — In-scope, factual
+## Category 2 — Website questions
 
-**Question:** What laptop specs do I need for this bootcamp?
+### Test 3
+
+**Question:** What courses does ZAIO offer?
 
 ```bash
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "What laptop specs do I need for this bootcamp?"}'
+  -d '{"question": "What courses does ZAIO offer?"}'
 ```
 
 | Field | Expected |
 |---|---|
-| Source | Page 5 |
-| Answer | Should mention i5/AMD 3000+/M1 processor, 4-8GB RAM, 256GB SSD |
+| Source | A zaio.io URL (likely the homepage or /bootcamps) |
+| Answer | Should mention several bootcamps — e.g. Full Stack AI Engineer, Cloud & DevOps, Data Science, Cybersecurity |
+
+### Test 4
+
+**Question:** How do the live classes work at ZAIO?
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "How do the live classes work at ZAIO?"}'
+```
+
+| Field | Expected |
+|---|---|
+| Source | A zaio.io URL (this is answered in the homepage FAQ section) |
+| Answer | Should mention live classes twice a week, recordings available |
+
+### Test 5
+
+**Question:** What payment options does ZAIO offer?
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What payment options does ZAIO offer?"}'
+```
+
+| Field | Expected |
+|---|---|
+| Source | A zaio.io URL |
+| Answer | Should mention upfront payment, instalments, or financing partners (Capitec/Manati) |
 
 ---
 
-### Test 6 — Out of scope (groundedness check)
+## Category 3 — Unanswerable (groundedness check)
+
+### Test 6
 
 **Question:** What is the capital of France?
 
@@ -117,21 +111,23 @@ curl -X POST http://localhost:8000/ask \
 | Field | Expected |
 |---|---|
 | Source | N/A |
-| Answer | Should say the information isn't available in the handbook — NOT "Paris" |
+| Answer | Exactly: "I could not find that information in the available knowledge base." |
 
-This last test is the most important one to actually run and check by hand.
-It proves the system isn't just using the LLM's general knowledge — it's
-only answering from the handbook, and admitting when it can't.
+This is the most important test to run and check by hand — it proves the
+system only answers from the two real knowledge sources and doesn't fall
+back on the LLM's own general knowledge.
 
 ---
 
 ## Results
 
-| # | Question | Expected Source | Actual Source | Answer Matches Expectation? |
-|---|---|---|---|---|
-| 1 | Total fees | Page 16 | Page 16 | Yes |
-| 2 | Fee deadline | Page 16 | | |
-| 3 | Grade breakdown | Page 14 | Page 14 | Yes |
-| 4 | Tutor hours | Page 20 | Page 20 | Yes |
-| 5 | Laptop specs | Page 5 | Page 5 | Yes |
-| 6 | Capital of France | N/A | N/A | Yes |
+Fill this in after running each test above against your live API:
+
+| # | Question | Category | Expected Source | Actual Source | Actual Answer (summary) | Pass? |
+|---|---|---|---|---|---|---|
+| 1 | Total fees | Handbook | Student Handbook - Page 16 | | | |
+| 2 | Tutor hours | Handbook | Student Handbook - Page 20 | | | |
+| 3 | Courses offered | Website | zaio.io URL | | | |
+| 4 | Live classes | Website | zaio.io URL | | | |
+| 5 | Payment options | Website | zaio.io URL | | | |
+| 6 | Capital of France | Unanswerable | N/A | | | |

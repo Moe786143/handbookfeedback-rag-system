@@ -14,16 +14,27 @@ custom exception handler, rather than letting FastAPI's default 500 errors
 leak through with a stack trace.
 """
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app.generator import generate_answer, pick_source
+from app.generator import generate_answer, pick_source, split_answer_and_citation
 from app.retriever import retrieve_chunks
 
 app = FastAPI(
     title="Student Handbook Assistant",
     description="RAG-based API that answers student questions from the bootcamp handbook.",
     version="1.0.0",
+)
+
+# Allows the React frontend (running on a different port during development)
+# to call this API from the browser. Browsers block cross-origin requests
+# by default unless the server explicitly opts in via these headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -35,8 +46,6 @@ class AskRequest(BaseModel):
     @field_validator("question")
     @classmethod
     def question_not_blank(cls, value: str) -> str:
-        # min_length=1 catches an empty string, but not one that's just
-        # whitespace — so blank submissions are rejected either way.
         if not value.strip():
             raise ValueError("question must not be empty or only whitespace")
         return value
@@ -58,31 +67,28 @@ def root():
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest):
     """
-    Answers a student's question using the handbook.
+    Answers a student's question using both knowledge sources.
 
     Pipeline: embed the question -> retrieve the most relevant chunks ->
     ask the LLM to answer using only those chunks -> return the answer
-    with a page citation.
+    with the correct citation.
     """
     try:
         chunks = retrieve_chunks(request.question)
     except RuntimeError as exc:
-        # Raised by retriever.py if ingestion hasn't been run yet.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        answer = generate_answer(request.question, chunks)
+        raw_response = generate_answer(request.question, chunks)
     except RuntimeError as exc:
-        # Raised by generator.py if GROQ_API_KEY is missing.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        # Anything else from the Groq call (rate limit, network issue, etc.)
-        # — surfaced as a clean 502 rather than a raw traceback.
         raise HTTPException(
             status_code=502, detail=f"The language model request failed: {exc}"
         ) from exc
 
-    source = pick_source(chunks, answer)
+    answer, claimed_label = split_answer_and_citation(raw_response)
+    source = pick_source(chunks, answer, claimed_label)
 
     return AskResponse(answer=answer, source=source)
 

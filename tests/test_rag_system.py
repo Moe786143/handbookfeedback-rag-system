@@ -1,13 +1,14 @@
 """
-Unit tests for the RAG system.
+Unit tests for the multi-source RAG system (Student Handbook + ZAIO website).
 
-Split into three groups matching the assignment's own parts:
-  - Ingestion (chunking logic — doesn't need the vector DB or an API key)
-  - API contract (request validation, error handling — mocks out the
-    actual retrieval/generation so tests run fast and don't need a live
-    Groq key or a populated ChromaDB)
-  - A note on end-to-end testing, which belongs in test_end_to_end.py
-    once the handbook has actually been ingested.
+Split into groups:
+  - Ingestion (chunking + metadata logic — pure functions, no external deps)
+  - Web scraper (HTML cleaning + domain filtering — pure functions, no
+    actual network calls, so these run offline)
+  - Generator (source citation formatting for each source type)
+  - API contract (request validation, error handling — mocks out actual
+    retrieval/generation so tests run fast without a live Groq key or a
+    populated ChromaDB collection)
 
 Run with:  pytest
 """
@@ -16,57 +17,161 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.ingest import chunk_text
+from app.generator import build_context, pick_source
+from app.ingest import _build_metadata, chunk_text
 from app.main import app
+from app.web_scraper import _is_crawlable, _same_domain, clean_page_text
 
 client = TestClient(app)
 
 
 # --------------------------------------------------------------------------
-# Ingestion tests — pure logic, no external dependencies
+# Ingestion tests — multi-source chunking and metadata
 # --------------------------------------------------------------------------
 
 
-def test_chunk_text_splits_long_page_into_multiple_chunks():
-    """A page with more words than chunk_size should produce >1 chunk."""
-    long_text = " ".join(f"word{i}" for i in range(500))
-    pages = [{"page": 1, "text": long_text}]
-
-    chunks = chunk_text(pages, chunk_size=100, overlap=20)
-
-    assert len(chunks) > 1
-    assert all(c["page"] == 1 for c in chunks)
-
-
-def test_chunk_text_keeps_short_page_as_one_chunk():
-    """A page shorter than chunk_size should stay as a single chunk."""
-    short_text = "This is a short page with only a few words."
-    pages = [{"page": 5, "text": short_text}]
-
-    chunks = chunk_text(pages, chunk_size=100, overlap=20)
-
-    assert len(chunks) == 1
-    assert chunks[0]["page"] == 5
-    assert chunks[0]["text"] == short_text
-
-
-def test_chunk_text_preserves_page_numbers_across_multiple_pages():
-    """Chunks must remember which page they came from — this is what
-    lets the API cite a source page in its response."""
-    pages = [
-        {"page": 1, "text": "Content from page one."},
-        {"page": 2, "text": "Content from page two."},
+def test_chunk_text_preserves_source_type():
+    """Chunks must remember whether they came from the Handbook or Website —
+    this is what makes correctly-formatted citations possible downstream."""
+    documents = [
+        {"source": "Handbook", "page": 16, "url": None, "text": "Fees information here."},
+        {"source": "Website", "page": None, "url": "https://www.zaio.io/bootcamps", "text": "Bootcamp information here."},
     ]
 
-    chunks = chunk_text(pages, chunk_size=50, overlap=5)
-    pages_seen = {c["page"] for c in chunks}
+    chunks = chunk_text(documents, chunk_size=50, overlap=5)
+    sources_seen = {c["source"] for c in chunks}
 
-    assert pages_seen == {1, 2}
+    assert sources_seen == {"Handbook", "Website"}
 
 
-def test_chunk_text_handles_empty_pages_list():
-    """Ingesting a document with no pages shouldn't raise an exception."""
-    assert chunk_text([]) == []
+def test_chunk_text_preserves_page_for_handbook_chunks():
+    documents = [{"source": "Handbook", "page": 16, "url": None, "text": "Fee content here."}]
+    chunks = chunk_text(documents, chunk_size=50, overlap=5)
+
+    assert all(c["page"] == 16 for c in chunks)
+    assert all(c["url"] is None for c in chunks)
+
+
+def test_chunk_text_preserves_url_for_website_chunks():
+    documents = [
+        {"source": "Website", "page": None, "url": "https://www.zaio.io/bootcamps", "text": "Bootcamp content here."}
+    ]
+    chunks = chunk_text(documents, chunk_size=50, overlap=5)
+
+    assert all(c["url"] == "https://www.zaio.io/bootcamps" for c in chunks)
+    assert all(c["page"] is None for c in chunks)
+
+
+def test_build_metadata_excludes_none_values():
+    """ChromaDB rejects None as a metadata value — the metadata builder
+    must only include the field that actually applies to each source."""
+    handbook_chunk = {"source": "Handbook", "page": 16, "url": None}
+    website_chunk = {"source": "Website", "page": None, "url": "https://www.zaio.io/bootcamps"}
+
+    handbook_meta = _build_metadata(handbook_chunk)
+    website_meta = _build_metadata(website_chunk)
+
+    assert None not in handbook_meta.values()
+    assert None not in website_meta.values()
+    assert handbook_meta == {"source": "Handbook", "page": 16}
+    assert website_meta == {"source": "Website", "url": "https://www.zaio.io/bootcamps"}
+
+
+# --------------------------------------------------------------------------
+# Web scraper tests — pure logic, no actual network calls
+# --------------------------------------------------------------------------
+
+
+def test_clean_page_text_removes_navigation():
+    html = "<html><body><nav><a href='/x'>Menu</a></nav><main><p>Real content</p></main></body></html>"
+    cleaned = clean_page_text(html)
+
+    assert "Real content" in cleaned
+    assert "Menu" not in cleaned
+
+
+def test_clean_page_text_removes_footer():
+    html = "<html><body><main><p>Real content</p></main><footer><p>Copyright 2026</p></footer></body></html>"
+    cleaned = clean_page_text(html)
+
+    assert "Real content" in cleaned
+    assert "Copyright" not in cleaned
+
+
+def test_clean_page_text_removes_scripts_and_styles():
+    html = "<html><head><script>track()</script><style>.a{color:red}</style></head><body><p>Content</p></body></html>"
+    cleaned = clean_page_text(html)
+
+    assert "Content" in cleaned
+    assert "track()" not in cleaned
+    assert "color:red" not in cleaned
+
+
+def test_same_domain_accepts_matching_host():
+    assert _same_domain("https://www.zaio.io/bootcamps", "www.zaio.io") is True
+
+
+def test_same_domain_rejects_subdomain():
+    """A different subdomain (applications.zaio.io) should not be treated
+    as the same site as www.zaio.io — the crawler must not wander onto it."""
+    assert _same_domain("https://applications.zaio.io/apply", "www.zaio.io") is False
+
+
+def test_same_domain_rejects_external_site():
+    assert _same_domain("https://discord.gg/invite", "www.zaio.io") is False
+
+
+def test_is_crawlable_rejects_mailto():
+    assert _is_crawlable("mailto:hello@zaio.io") is False
+
+
+def test_is_crawlable_rejects_tel():
+    assert _is_crawlable("tel:+27213006808") is False
+
+
+def test_is_crawlable_rejects_binary_files():
+    assert _is_crawlable("https://www.zaio.io/logo.png") is False
+    assert _is_crawlable("https://www.zaio.io/handbook.pdf") is False
+
+
+def test_is_crawlable_accepts_normal_page():
+    assert _is_crawlable("https://www.zaio.io/bootcamps") is True
+
+
+# --------------------------------------------------------------------------
+# Generator tests — source citation formatting
+# --------------------------------------------------------------------------
+
+
+def test_pick_source_formats_handbook_citation():
+    chunk = {"source": "Handbook", "page": 16, "url": None, "text": "..."}
+    assert pick_source([chunk], "Some answer") == "Student Handbook - Page 16"
+
+
+def test_pick_source_formats_website_citation():
+    chunk = {"source": "Website", "page": None, "url": "https://www.zaio.io/bootcamps", "text": "..."}
+    assert pick_source([chunk], "Some answer") == "https://www.zaio.io/bootcamps"
+
+
+def test_pick_source_returns_na_when_not_found():
+    from app.config import NOT_FOUND_MESSAGE
+
+    chunk = {"source": "Handbook", "page": 16, "url": None, "text": "..."}
+    assert pick_source([chunk], NOT_FOUND_MESSAGE) == "N/A"
+
+
+def test_pick_source_returns_na_for_empty_chunks():
+    assert pick_source([], "anything") == "N/A"
+
+
+def test_build_context_labels_each_chunk_by_source():
+    handbook_chunk = {"source": "Handbook", "page": 16, "url": None, "text": "Fee info"}
+    website_chunk = {"source": "Website", "page": None, "url": "https://www.zaio.io/bootcamps", "text": "Bootcamp info"}
+
+    context = build_context([handbook_chunk, website_chunk])
+
+    assert "Student Handbook - Page 16" in context
+    assert "ZAIO Website - https://www.zaio.io/bootcamps" in context
 
 
 # --------------------------------------------------------------------------
@@ -82,8 +187,6 @@ def test_root_endpoint_reports_healthy():
 
 
 def test_ask_rejects_missing_question_field():
-    """Part 5: the API must handle invalid requests gracefully — a request
-    body with no 'question' key should return 422, not crash."""
     response = client.post("/ask", json={})
     assert response.status_code == 422
 
@@ -99,8 +202,6 @@ def test_ask_rejects_whitespace_only_question():
 
 
 def test_ask_rejects_malformed_json():
-    """Sending a body that isn't valid JSON at all should not crash the
-    server — FastAPI/Starlette returns 422 for this automatically."""
     response = client.post(
         "/ask",
         content=b"{not valid json",
@@ -111,20 +212,39 @@ def test_ask_rejects_malformed_json():
 
 @patch("app.main.generate_answer")
 @patch("app.main.retrieve_chunks")
-def test_ask_returns_answer_and_source_on_success(mock_retrieve, mock_generate):
-    """With retrieval and generation mocked, confirm the endpoint wires
-    everything together correctly and returns the expected JSON shape."""
+def test_ask_returns_handbook_citation_on_success(mock_retrieve, mock_generate):
     mock_retrieve.return_value = [
-        {"text": "Fees must be paid before orientation day.", "page": 16, "distance": 0.1}
+        {"text": "Fees are R38,950.", "source": "Handbook", "page": 16, "url": None, "distance": 0.1}
     ]
-    mock_generate.return_value = "Fees must be paid in full before orientation day."
+    mock_generate.return_value = "The total fees are R38,950."
 
-    response = client.post("/ask", json={"question": "When must fees be paid?"})
+    response = client.post("/ask", json={"question": "What are the fees?"})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["answer"] == "Fees must be paid in full before orientation day."
-    assert body["source"] == "Page 16"
+    assert body["answer"] == "The total fees are R38,950."
+    assert body["source"] == "Student Handbook - Page 16"
+
+
+@patch("app.main.generate_answer")
+@patch("app.main.retrieve_chunks")
+def test_ask_returns_website_url_on_success(mock_retrieve, mock_generate):
+    mock_retrieve.return_value = [
+        {
+            "text": "Full Stack AI Engineer bootcamp.",
+            "source": "Website",
+            "page": None,
+            "url": "https://www.zaio.io/fullstack-ai-engineer-bootcamp",
+            "distance": 0.1,
+        }
+    ]
+    mock_generate.return_value = "ZAIO offers a Full Stack AI Engineer bootcamp."
+
+    response = client.post("/ask", json={"question": "What courses does ZAIO offer?"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "https://www.zaio.io/fullstack-ai-engineer-bootcamp"
 
 
 @patch("app.main.generate_answer")
@@ -132,18 +252,14 @@ def test_ask_returns_answer_and_source_on_success(mock_retrieve, mock_generate):
 def test_ask_returns_not_available_source_when_llm_cannot_answer(
     mock_retrieve, mock_generate
 ):
-    """When the handbook doesn't cover a question, the source should be
-    N/A rather than pointing at an irrelevant page."""
     from app.config import NOT_FOUND_MESSAGE
 
     mock_retrieve.return_value = [
-        {"text": "Unrelated handbook content.", "page": 3, "distance": 0.9}
+        {"text": "Unrelated content.", "source": "Handbook", "page": 3, "url": None, "distance": 0.9}
     ]
     mock_generate.return_value = NOT_FOUND_MESSAGE
 
-    response = client.post(
-        "/ask", json={"question": "What is the capital of France?"}
-    )
+    response = client.post("/ask", json={"question": "What is the capital of France?"})
 
     assert response.status_code == 200
     body = response.json()
@@ -152,11 +268,9 @@ def test_ask_returns_not_available_source_when_llm_cannot_answer(
 
 
 @patch("app.main.retrieve_chunks")
-def test_ask_returns_503_when_handbook_not_ingested(mock_retrieve):
-    """If run_ingest.py hasn't been run yet, the API should fail clearly
-    rather than with an obscure ChromaDB error."""
+def test_ask_returns_503_when_knowledge_base_not_ingested(mock_retrieve):
     mock_retrieve.side_effect = RuntimeError(
-        "Handbook collection not found. Run `python run_ingest.py` first."
+        "Knowledge base not found. Run `python run_ingest.py` first."
     )
 
     response = client.post("/ask", json={"question": "What are the fees?"})

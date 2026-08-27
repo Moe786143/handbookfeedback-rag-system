@@ -1,22 +1,31 @@
 # Student Handbook Assistant — RAG System
 
 A Retrieval-Augmented Generation API that answers student questions using
-the Full-Stack AI Engineer Bootcamp handbook as its only source of truth.
-If the handbook doesn't cover a question, it says so instead of guessing.
+**two** knowledge sources — the Full-Stack AI Engineer Bootcamp handbook
+and the live [ZAIO website](https://www.zaio.io) — as its only sources of
+truth. If neither source covers a question, it says so instead of guessing.
 
 ## How it works
 
 ```
-Handbook PDF
-     │
-     ▼
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Extract    │ --> │    Chunk     │ --> │    Embed     │ --> ChromaDB
-│  text/page   │     │ (220 words,  │     │ (MiniLM-L6)  │   (persisted)
-│              │     │  40 overlap) │     │              │
-└─────────────┘     └──────────────┘     └──────────────┘
+Student Handbook PDF                    ZAIO Website (crawled)
+        │                                        │
+        ▼                                        ▼
+┌──────────────┐                       ┌──────────────────┐
+│   Extract    │                       │  Crawl same-domain │
+│  text/page   │                       │  pages, clean nav/  │
+│              │                       │  header/footer      │
+└──────┬───────┘                       └─────────┬──────────┘
+       │                                          │
+       └──────────────────┬───────────────────────┘
+                           ▼
+                  ┌──────────────┐     ┌──────────────┐
+                  │    Chunk     │ --> │    Embed     │ --> ChromaDB
+                  │ (per page /  │     │ (MiniLM-L6)  │  (one collection,
+                  │  per URL)    │     │              │   tagged by source)
+                  └──────────────┘     └──────────────┘
 
-                              ── run once, via run_ingest.py ──
+                    ── run once, via run_ingest.py ──
 
 
 User question
@@ -24,8 +33,9 @@ User question
      ▼
 ┌──────────────┐     ┌───────────────┐     ┌──────────────┐
 │    Embed      │ --> │  Search top   │ --> │  Send chunks │ --> Answer
-│   question    │     │ 4 chunks in   │     │  + question  │   + Source
-│               │     │   ChromaDB    │     │  to Groq LLM │
+│   question    │     │ 4 chunks      │     │  + question  │   + Source
+│               │     │ across BOTH   │     │  to Groq LLM │  (page or URL)
+│               │     │ sources       │     │              │
 └──────────────┘     └───────────────┘     └──────────────┘
 
                               ── happens on every POST /ask ──
@@ -34,30 +44,42 @@ User question
 **Embeddings:** `sentence-transformers` (`all-MiniLM-L6-v2`) — runs locally,
 free, no API key needed for this part.
 
-**Vector database:** ChromaDB, persisted to disk — ingestion only needs to
-run once; the API reads from the same store on every request.
+**Vector database:** ChromaDB, one collection holding chunks from both
+sources. Each chunk's metadata records `source: "Handbook"` (with a page
+number) or `source: "Website"` (with a URL) — this is what lets a single
+similarity search return the best match regardless of where it came from,
+and what lets the API cite the right kind of source afterward.
+
+**Website crawling:** plain Python (`requests` + `BeautifulSoup`), not
+Puppeteer. The ZAIO site is server-rendered — its HTML already contains
+the real page content without needing JavaScript to run first, which is
+what a headless browser would be for. Using a lighter, pure-Python crawler
+keeps the whole project in one language. See `app/web_scraper.py` for the
+crawl logic (same-domain filtering, boilerplate removal) and its docstring
+for the reasoning.
 
 **LLM:** [Groq](https://groq.com) (free tier, fast inference) running
-`llama-3.1-8b-instant`. The system prompt instructs it to answer only from
-the retrieved handbook excerpts and to say so plainly if the answer isn't
-there — this is what prevents hallucinated answers.
+`openai/gpt-oss-20b`. The system prompt instructs it to answer only from
+the retrieved excerpts — from either source — and to say so plainly if
+neither one covers the question.
 
 ## Project structure
 
 ```
 rag-system/
 ├── app/
-│   ├── config.py       # environment variables and settings
-│   ├── ingest.py        # PDF loading, chunking, embedding, storage
-│   ├── retriever.py      # embeds a question, searches ChromaDB
-│   ├── generator.py       # builds the prompt, calls Groq
-│   └── main.py             # FastAPI app, POST /ask endpoint
+│   ├── config.py        # environment variables and settings
+│   ├── web_scraper.py     # crawls the ZAIO website, cleans HTML
+│   ├── ingest.py           # loads PDF + crawls website, chunks, embeds, stores
+│   ├── retriever.py         # embeds a question, searches ChromaDB
+│   ├── generator.py          # builds the prompt, calls Groq, formats citations
+│   └── main.py                 # FastAPI app, POST /ask endpoint
 ├── data/
-│   └── handbook.pdf        # the source document
+│   └── handbook.pdf            # the PDF source document
 ├── tests/
-│   └── test_rag_system.py  # unit tests (chunking + API contract)
-├── run_ingest.py            # run once to build the vector store
-├── MANUAL_TESTS.md          # sample questions with expected sources/answers
+│   └── test_rag_system.py      # unit tests (chunking, scraping, citations, API)
+├── run_ingest.py                # run once to build the vector store
+├── MANUAL_TESTS.md              # sample questions with expected sources/answers
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -181,11 +203,39 @@ without this quirk wouldn't need that repair step at all.
 
 ## Preparing for n8n (Part 5)
 
-This API is intentionally built to be easy to call from an n8n HTTP Request
-node in a future practical:
+This API is intentionally easy to call from an n8n HTTP Request node:
 - Accepts a plain JSON body — no special headers or auth beyond
   `Content-Type: application/json`
 - Always returns JSON, even on error (never an HTML error page)
-- Validation errors return `422`, missing setup (handbook not ingested,
-  API key missing) returns `503`, and upstream LLM failures return `502`
-  — distinct status codes an n8n IF node could branch on later
+- Validation errors return `422`, missing setup (knowledge base not
+  ingested, API key missing) returns `503`, and upstream LLM failures
+  return `502` — distinct status codes an n8n IF node can branch on
+
+### The actual n8n workflow
+
+A ready-to-import workflow is included at `n8n-workflow.json` in this repo:
+
+**Webhook** → **HTTP Request** (calls this API) → **Send Email** (Gmail) → **Respond to Webhook**
+
+To use it:
+1. In n8n, click **Import from File** and select `n8n-workflow.json`
+2. Open the **Send Email** node and reconnect it to your own Gmail
+   credential (the imported file has a placeholder credential ID)
+3. Check the **Webhook** node's path and the **HTTP Request** node's URL
+   match your running setup
+4. Test it with: `curl -X POST http://localhost:5678/webhook/ask-rag -H "Content-Type: application/json" -d '{"question": "What are the total fees?", "email": "you@example.com"}'`
+
+Node field names can shift slightly between n8n versions, so treat the
+import as a strong starting point — verify each node's settings against
+what your version actually shows, the same way the student feedback
+workflow in the previous practical was built up manually, node by node.
+
+If you'd rather build it from scratch instead of importing, the same four
+nodes in the same order work:
+1. **Webhook** node — Method: `POST`, Path: `ask-rag` — receives
+   `{"question": "...", "email": "..."}`
+2. **HTTP Request** node — `POST http://localhost:8000/ask`, JSON body
+   `{"question": "{{ $json.body.question }}"}`
+3. **Send Email** (Gmail) node — body using `{{ $json.answer }}` and
+   `{{ $json.source }}` from the HTTP Request node's response
+4. **Respond to Webhook** node — sends a simple acknowledgement back

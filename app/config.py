@@ -10,7 +10,7 @@ load_dotenv()
 
 # --- Groq (LLM) ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # --- Embeddings ---
 # all-MiniLM-L6-v2 is small, fast, and free — runs locally, no API needed.
@@ -29,10 +29,15 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "40"))
 # --- Retrieval ---
 TOP_K = int(os.getenv("TOP_K", "4"))
 
-# --- Source document ---
+# --- Source document (PDF) ---
 HANDBOOK_PATH = os.getenv("HANDBOOK_PATH", "./data/handbook.pdf")
 
-# Message returned when the handbook genuinely doesn't cover the question.
+# --- Source document (Website) ---
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://www.zaio.io")
+WEBSITE_MAX_PAGES = int(os.getenv("WEBSITE_MAX_PAGES", "12"))
+
+# Message returned when neither knowledge source covers the question.
+# This exact wording is what the assignment specifies.
 NOT_FOUND_MESSAGE = (
-    "I don't know — that information isn't available in the student handbook."
+    "I could not find that information in the available knowledge base."
 )
