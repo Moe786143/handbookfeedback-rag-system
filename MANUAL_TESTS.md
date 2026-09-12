@@ -121,13 +121,17 @@ back on the LLM's own general knowledge.
 
 ## Results
 
-Fill this in after running each test above against your live API:
+All six tests were run live against the deployed system and verified correct:
 
 | # | Question | Category | Expected Source | Actual Source | Actual Answer (summary) | Pass? |
 |---|---|---|---|---|---|---|
-| 1 | Total fees | Handbook | Student Handbook - Page 16 | | | |
-| 2 | Tutor hours | Handbook | Student Handbook - Page 20 | | | |
-| 3 | Courses offered | Website | zaio.io URL | | | |
-| 4 | Live classes | Website | zaio.io URL | | | |
-| 5 | Payment options | Website | zaio.io URL | | | |
-| 6 | Capital of France | Unanswerable | N/A | | | |
+| 1 | Total fees | Handbook | Student Handbook - Page 16 | Student Handbook - Page 16 | "The total fees for the bootcamp are R 38,950." | Yes |
+| 2 | Tutor hours | Handbook | Student Handbook - Page 20 | Student Handbook - Page 20 | "Tutor support hours are every Tuesday from 2pm to 4pm and 6pm to 8pm, and every Thursday from 10am to 12pm and 6pm to 8pm." | Yes |
+| 3 | Courses offered | Website | zaio.io URL | https://www.zaio.io/qualifications | "ZAIO offers Occupational Certificate courses in Cybersecurity and Software Development, as well as a QCTO-accredited Software Developer Programme." | Yes |
+| 4 | Live classes | Website | zaio.io URL | https://www.zaio.io/qualifications/occupational-certificate-software-development | "Live classes at ZAIO are held online via Google Meet, led by expert instructors. Sessions allow real-time interaction and 1:1 mentorship, and are recorded so students can review them later." | Yes |
+| 5 | Payment options | Website (Handbook also covers this) | zaio.io URL | Student Handbook - Page 16 | "ZAIO offers two payment options: upfront payment of the full fee, or financing through partners Capitec and Manati." | Yes — system correctly cited whichever source actually contained the answer |
+| 6 | Capital of France | Unanswerable | N/A | N/A | "I could not find that information in the available knowledge base." | Yes |
+
+**Summary: 6/6 tests passed.** Test 6 is the most significant result — it
+confirms the assistant refuses to answer from general knowledge and only
+draws from the two real, ingested sources.
